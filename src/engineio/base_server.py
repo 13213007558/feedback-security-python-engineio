@@ -38,6 +38,7 @@ class BaseServer:
                  cookie=None, cors_allowed_origins=None,
                  cors_credentials=True, logger=False, json=None,
                  async_handlers=True, monitor_clients=None, transports=None,
+                 max_decode_packets=None, max_decoded_packet_size=None,
                  **kwargs):
         self.ping_timeout = ping_timeout
         if isinstance(ping_interval, tuple):
@@ -47,6 +48,8 @@ class BaseServer:
             self.ping_interval = ping_interval
             self.ping_interval_grace_period = 0
         self.max_http_buffer_size = max_http_buffer_size
+        self.max_decode_packets = max_decode_packets
+        self.max_decoded_packet_size = max_decoded_packet_size
         self.allow_upgrades = allow_upgrades
         self.http_compression = http_compression
         self.compression_threshold = compression_threshold

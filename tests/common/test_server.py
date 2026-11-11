@@ -14,6 +14,7 @@ from engineio import json
 from engineio import packet
 from engineio import payload
 from engineio import server
+from engineio import socket
 
 original_import_module = importlib.import_module
 
@@ -82,11 +83,18 @@ class TestServer:
             'cors_allowed_origins': ['foo', 'bar', 'baz'],
             'cors_credentials': False,
             'async_handlers': False,
+            'max_decode_packets': 5,
+            'max_decoded_packet_size': 6,
         }
         s = server.Server(**kwargs)
         for arg in kwargs.keys():
             assert getattr(s, arg) == kwargs[arg]
         assert s.ping_interval_grace_period == 0
+
+    def test_create_default_payload_limits(self):
+        s = server.Server()
+        assert s.max_decode_packets is None
+        assert s.max_decoded_packet_size is None
 
     def test_create_with_grace_period(self):
         s = server.Server(ping_interval=(1, 2))
@@ -1001,6 +1009,93 @@ class TestServer:
         s.handle_request(environ, start_response)
         assert start_response.call_args[0][0] == '400 BAD REQUEST'
         assert 'foo' not in s.sockets
+
+    def test_post_request_payload_limit_error(self):
+        s = server.Server()
+        mock_socket = self._get_mock_socket()
+        mock_socket.connected = True
+        mock_socket.handle_post_request = mock.MagicMock(
+            side_effect=[exceptions.ContentTooLongError]
+        )
+        s.sockets['foo'] = mock_socket
+        environ = {'REQUEST_METHOD': 'POST', 'QUERY_STRING': 'EIO=4&sid=foo'}
+        start_response = mock.MagicMock()
+        s.handle_request(environ, start_response)
+        assert start_response.call_args[0][0] == '400 BAD REQUEST'
+
+    def test_payload_limits_are_per_instance(self):
+        # two servers with different payload limits receive the same
+        # inputs interleaved, and each enforces only its own limits
+        restrictive = server.Server(async_handlers=False,
+                                    max_decode_packets=1,
+                                    max_decoded_packet_size=4)
+        permissive = server.Server(async_handlers=False,
+                                   max_decode_packets=8,
+                                   max_decoded_packet_size=64)
+        received = {'restrictive': [], 'permissive': []}
+        restrictive.on(
+            'message',
+            lambda sid, data: received['restrictive'].append(data))
+        permissive.on(
+            'message',
+            lambda sid, data: received['permissive'].append(data))
+        servers = {'restrictive': restrictive, 'permissive': permissive}
+        sockets = {}
+        for name, s in servers.items():
+            sockets[name] = socket.Socket(s, 'foo')
+            sockets[name].connected = True
+            s.sockets['foo'] = sockets[name]
+
+        small_batch = payload.Payload(packets=[
+            packet.Packet(packet.MESSAGE, data='hi'),
+            packet.Packet(packet.MESSAGE, data='yo'),
+        ]).encode().encode('utf-8')
+        big_message = payload.Payload(packets=[
+            packet.Packet(packet.MESSAGE, data='x' * 32),
+        ]).encode().encode('utf-8')
+        tiny_message = payload.Payload(packets=[
+            packet.Packet(packet.MESSAGE, data='ok'),
+        ]).encode().encode('utf-8')
+
+        def post(name, body):
+            environ = {
+                'REQUEST_METHOD': 'POST',
+                'QUERY_STRING': 'sid=foo',
+                'CONTENT_LENGTH': len(body),
+                'wsgi.input': io.BytesIO(body),
+            }
+            try:
+                sockets[name].handle_post_request(environ)
+                return 'ok'
+            except exceptions.ContentTooLongError:
+                return 'rejected'
+
+        results = []
+        for body in (small_batch, big_message, tiny_message):
+            for name in ('restrictive', 'permissive'):
+                results.append((name, post(name, body)))
+        assert results == [
+            ('restrictive', 'rejected'), ('permissive', 'ok'),
+            ('restrictive', 'rejected'), ('permissive', 'ok'),
+            ('restrictive', 'ok'), ('permissive', 'ok'),
+        ]
+        # the rejections were atomic: the restrictive server did not
+        # deliver any packet from the rejected payloads
+        assert received['restrictive'] == ['ok']
+        assert received['permissive'] == ['hi', 'yo', 'x' * 32, 'ok']
+
+        # relaxing the restrictive server does not affect the permissive
+        # one, and the process-wide defaults are untouched
+        restrictive.max_decode_packets = 8
+        restrictive.max_decoded_packet_size = 64
+        assert post('restrictive', small_batch) == 'ok'
+        assert post('permissive', small_batch) == 'ok'
+        assert received['restrictive'] == ['ok', 'hi', 'yo']
+        assert received['permissive'] == [
+            'hi', 'yo', 'x' * 32, 'ok', 'hi', 'yo']
+        assert permissive.max_decode_packets == 8
+        assert permissive.max_decoded_packet_size == 64
+        assert payload.Payload.max_decode_packets == 16
 
     @staticmethod
     def _gzip_decompress(b):

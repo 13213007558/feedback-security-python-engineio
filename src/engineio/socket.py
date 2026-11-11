@@ -110,7 +110,16 @@ class Socket(base_socket.BaseSocket):
             raise exceptions.ContentTooLongError()
         else:
             body = environ['wsgi.input'].read(length).decode('utf-8')
-            p = payload.Payload(encoded_payload=body)
+            try:
+                p = payload.Payload(
+                    encoded_payload=body,
+                    max_decode_packets=self.server.max_decode_packets,
+                    max_decoded_packet_size=
+                    self.server.max_decoded_packet_size)
+            except ValueError as e:
+                # the payload is invalid or exceeds the configured limits,
+                # so it is rejected before any of its packets are delivered
+                raise exceptions.ContentTooLongError(str(e))
             for pkt in p.packets:
                 self.receive(pkt)
 

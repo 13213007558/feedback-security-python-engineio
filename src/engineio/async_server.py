@@ -41,6 +41,25 @@ class AsyncServer(base_server.BaseServer):
                                  spite of its name, the value set in this
                                  argument is enforced for HTTP long-polling and
                                  WebSocket connections.
+    :param max_decode_packets: The maximum number of packets that are
+                               accepted in a single HTTP long-polling
+                               payload, counted in packets. The default is
+                               16 packets. Each server instance has its own
+                               limit, so servers that need to accept large
+                               batches and servers that should only accept
+                               small payloads can coexist in the same
+                               process.
+    :param max_decoded_packet_size: The maximum size that is accepted for
+                                    the decoded data of each packet in an
+                                    HTTP long-polling payload, given in
+                                    bytes. For text packets this is the
+                                    size of the UTF-8 encoded packet data,
+                                    and for base64 encoded binary packets
+                                    it is the size of the decoded binary
+                                    data. The default is ``None``, which
+                                    disables this check and leaves
+                                    ``max_http_buffer_size`` as the only
+                                    size limit.
     :param allow_upgrades: Whether to allow transport upgrades or not.
     :param http_compression: Whether to compress packages when using the
                              polling transport.

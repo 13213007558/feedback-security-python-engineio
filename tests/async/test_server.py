@@ -8,11 +8,20 @@ import zlib
 import pytest
 
 from engineio import async_server
+from engineio import async_socket
 from engineio.async_drivers import aiohttp as async_aiohttp
 from engineio import exceptions
 from engineio import json
 from engineio import packet
 from engineio import payload
+
+
+class AsyncBytesIO:
+    def __init__(self, data):
+        self.data = data
+
+    async def read(self, length):
+        return self.data[:length]
 
 
 class TestAsyncServer:
@@ -71,6 +80,85 @@ class TestAsyncServer:
     async def test_async_modes(self):
         s = async_server.AsyncServer()
         assert s.async_modes() == ['aiohttp', 'sanic', 'tornado', 'asgi']
+
+    async def test_create_default_payload_limits(self):
+        s = async_server.AsyncServer()
+        assert s.max_decode_packets is None
+        assert s.max_decoded_packet_size is None
+
+    async def test_payload_limits_are_per_instance(self):
+        # two servers with different payload limits receive the same
+        # inputs interleaved, and each enforces only its own limits
+        restrictive = async_server.AsyncServer(async_handlers=False,
+                                               max_decode_packets=1,
+                                               max_decoded_packet_size=4)
+        permissive = async_server.AsyncServer(async_handlers=False,
+                                              max_decode_packets=8,
+                                              max_decoded_packet_size=64)
+        received = {'restrictive': [], 'permissive': []}
+        restrictive.on(
+            'message',
+            lambda sid, data: received['restrictive'].append(data))
+        permissive.on(
+            'message',
+            lambda sid, data: received['permissive'].append(data))
+        servers = {'restrictive': restrictive, 'permissive': permissive}
+        sockets = {}
+        for name, s in servers.items():
+            sockets[name] = async_socket.AsyncSocket(s, 'foo')
+            sockets[name].connected = True
+            s.sockets['foo'] = sockets[name]
+
+        small_batch = payload.Payload(packets=[
+            packet.Packet(packet.MESSAGE, data='hi'),
+            packet.Packet(packet.MESSAGE, data='yo'),
+        ]).encode().encode('utf-8')
+        big_message = payload.Payload(packets=[
+            packet.Packet(packet.MESSAGE, data='x' * 32),
+        ]).encode().encode('utf-8')
+        tiny_message = payload.Payload(packets=[
+            packet.Packet(packet.MESSAGE, data='ok'),
+        ]).encode().encode('utf-8')
+
+        async def post(name, body):
+            environ = {
+                'REQUEST_METHOD': 'POST',
+                'QUERY_STRING': 'sid=foo',
+                'CONTENT_LENGTH': len(body),
+                'wsgi.input': AsyncBytesIO(body),
+            }
+            try:
+                await sockets[name].handle_post_request(environ)
+                return 'ok'
+            except exceptions.ContentTooLongError:
+                return 'rejected'
+
+        results = []
+        for body in (small_batch, big_message, tiny_message):
+            for name in ('restrictive', 'permissive'):
+                results.append((name, await post(name, body)))
+        assert results == [
+            ('restrictive', 'rejected'), ('permissive', 'ok'),
+            ('restrictive', 'rejected'), ('permissive', 'ok'),
+            ('restrictive', 'ok'), ('permissive', 'ok'),
+        ]
+        # the rejections were atomic: the restrictive server did not
+        # deliver any packet from the rejected payloads
+        assert received['restrictive'] == ['ok']
+        assert received['permissive'] == ['hi', 'yo', 'x' * 32, 'ok']
+
+        # relaxing the restrictive server does not affect the permissive
+        # one, and the process-wide defaults are untouched
+        restrictive.max_decode_packets = 8
+        restrictive.max_decoded_packet_size = 64
+        assert await post('restrictive', small_batch) == 'ok'
+        assert await post('permissive', small_batch) == 'ok'
+        assert received['restrictive'] == ['ok', 'hi', 'yo']
+        assert received['permissive'] == [
+            'hi', 'yo', 'x' * 32, 'ok', 'hi', 'yo']
+        assert permissive.max_decode_packets == 8
+        assert permissive.max_decoded_packet_size == 64
+        assert payload.Payload.max_decode_packets == 16
 
     async def test_async_mode_aiohttp(self):
         s = async_server.AsyncServer(async_mode='aiohttp')

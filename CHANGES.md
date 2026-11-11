@@ -1,5 +1,10 @@
 # python-engineio change log
 
+**Unreleased**
+
+- Server: add per-instance `max_decode_packets` and `max_decoded_packet_size` options to limit incoming long-polling payloads independently of other server instances
+- Server: return a 400 error when a long-polling payload cannot be decoded or exceeds the configured limits, instead of silently accepting the request
+
 **Release 4.15.1** - 2026-10-28
 
 - Reject requests before the connection completes ([commit](https://code.miguelgrinberg.com/miguelgrinberg/python-engineio.git/commit/89ce40654dcb23405e7f78b04d9b38aacf05987c))

@@ -24,6 +24,8 @@ class TestSocket:
         mock_server.ping_interval_grace_period = 0.001
         mock_server.async_handlers = False
         mock_server.max_http_buffer_size = 128
+        mock_server.max_decode_packets = None
+        mock_server.max_decoded_packet_size = None
         mock_server._async = {
             'asyncio': True,
             'create_route': mock.MagicMock(),
@@ -228,6 +230,64 @@ class TestSocket:
         }
         with pytest.raises(exceptions.ContentTooLongError):
             await s.handle_post_request(environ)
+
+    async def test_polling_write_too_many_packets(self):
+        mock_server = self._get_mock_server()
+        mock_server.max_http_buffer_size = 1000
+        mock_server.max_decode_packets = 1
+        pkt1 = packet.Packet(packet.MESSAGE, data='hello')
+        pkt2 = packet.Packet(packet.MESSAGE, data='bye')
+        p = payload.Payload(packets=[pkt1, pkt2]).encode().encode('utf-8')
+        s = async_socket.AsyncSocket(mock_server, 'foo')
+        s.receive = mock.AsyncMock()
+        environ = {
+            'REQUEST_METHOD': 'POST',
+            'QUERY_STRING': 'sid=foo',
+            'CONTENT_LENGTH': len(p),
+            'wsgi.input': self._get_read_mock_coro(p),
+        }
+        with pytest.raises(exceptions.ContentTooLongError):
+            await s.handle_post_request(environ)
+        assert s.receive.await_count == 0
+
+    async def test_polling_write_decoded_packet_too_large(self):
+        mock_server = self._get_mock_server()
+        mock_server.max_http_buffer_size = 1000
+        mock_server.max_decoded_packet_size = 4
+        pkt = packet.Packet(packet.MESSAGE, data='hello')
+        p = payload.Payload(packets=[pkt]).encode().encode('utf-8')
+        s = async_socket.AsyncSocket(mock_server, 'foo')
+        s.receive = mock.AsyncMock()
+        environ = {
+            'REQUEST_METHOD': 'POST',
+            'QUERY_STRING': 'sid=foo',
+            'CONTENT_LENGTH': len(p),
+            'wsgi.input': self._get_read_mock_coro(p),
+        }
+        with pytest.raises(exceptions.ContentTooLongError):
+            await s.handle_post_request(environ)
+        assert s.receive.await_count == 0
+
+    async def test_polling_write_limit_error_is_atomic(self):
+        # a valid packet followed by an oversized packet must not deliver
+        # the valid packet before the error is raised
+        mock_server = self._get_mock_server()
+        mock_server.max_http_buffer_size = 1000
+        mock_server.max_decoded_packet_size = 4
+        pkt1 = packet.Packet(packet.MESSAGE, data='ok')
+        pkt2 = packet.Packet(packet.MESSAGE, data='hello')
+        p = payload.Payload(packets=[pkt1, pkt2]).encode().encode('utf-8')
+        s = async_socket.AsyncSocket(mock_server, 'foo')
+        s.receive = mock.AsyncMock()
+        environ = {
+            'REQUEST_METHOD': 'POST',
+            'QUERY_STRING': 'sid=foo',
+            'CONTENT_LENGTH': len(p),
+            'wsgi.input': self._get_read_mock_coro(p),
+        }
+        with pytest.raises(exceptions.ContentTooLongError):
+            await s.handle_post_request(environ)
+        assert s.receive.await_count == 0
 
     async def test_polling_write_without_content_length(self):
         mock_server = self._get_mock_server()
