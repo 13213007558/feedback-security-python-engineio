@@ -541,6 +541,7 @@ class TestSocket:
         mock_server = self._get_mock_server()
         s = socket.Socket(mock_server, 'sid')
         s.queue = mock.MagicMock()
+        s.queue.empty.return_value = False
         s.close(wait=True)
         s.queue.join.assert_called_once_with()
 

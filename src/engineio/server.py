@@ -4,6 +4,7 @@ import urllib
 from . import base_server
 from . import exceptions
 from . import packet
+from . import payload
 from . import socket
 
 default_logger = logging.getLogger('engineio.server')
@@ -315,32 +316,49 @@ class Server(base_server.BaseServer):
                 self._log_error_once(f'Invalid session {sid}', 'bad-sid')
                 r = self._bad_request(f'Invalid session {sid}')
             else:
-                socket = self._get_socket(sid)
-                if not socket.connected:
-                    # cannot accept requests before connecting
-                    self._log_error_once(
-                        f'Socket for session {sid} is not connected',
-                        'not-connected')
-                    r = self._bad_request('Not connected')
-                elif not socket.upgraded:
-                    try:
-                        socket.handle_post_request(environ)
-                        r = self._ok(jsonp_index=jsonp_index)
-                    except exceptions.EngineIOError:
-                        if sid in self.sockets:  # pragma: no cover
-                            self.disconnect(sid)
-                        r = self._bad_request()
-                    except:  # pragma: no cover
-                        # for any other unexpected errors, we log the error
-                        # and keep going
-                        self.logger.exception('post request handler error')
-                        r = self._ok(jsonp_index=jsonp_index)
+                try:
+                    socket = self._get_socket(sid)
+                except KeyError as e:
+                    self._log_error_once(f'{e} {sid}', 'bad-sid')
+                    r = self._bad_request(f'{e} {sid}')
                 else:
-                    # cannot accept HTTP requests once upgraded
-                    self._log_error_once(
-                        f'Unexpected HTTP request for session {sid}',
-                        'unexpected-http')
-                    r = self._bad_request('Unexpected HTTP request')
+                    if not socket.connected or socket.closing or \
+                            socket.closed:
+                        # cannot accept requests before connecting or once
+                        # the socket has started shutting down
+                        self._log_error_once(
+                            f'Socket for session {sid} is not connected',
+                            'not-connected')
+                        r = self._bad_request('Not connected')
+                    elif not socket.upgraded:
+                        try:
+                            socket.handle_post_request(environ)
+                            r = self._ok(jsonp_index=jsonp_index)
+                        except payload.PayloadDecodeError:
+                            # The request body cannot be parsed: report a bad
+                            # request but keep the session alive, this is not a
+                            # client initiated disconnect.
+                            r = self._bad_request()
+                        except exceptions.EngineIOError:
+                            socket.close(wait=False,
+                                         reason=self.reason.TRANSPORT_ERROR)
+                            if sid in self.sockets:
+                                del self.sockets[sid]
+                            r = self._bad_request()
+                        except:  # pragma: no cover
+                            # for any other unexpected errors, we log the error
+                            # and keep going
+                            self.logger.exception('post request handler error')
+                            r = self._ok(jsonp_index=jsonp_index)
+                        if sid in self.sockets and \
+                                self.sockets[sid].closed:
+                            del self.sockets[sid]
+                    else:
+                        # cannot accept HTTP requests once upgraded
+                        self._log_error_once(
+                            f'Unexpected HTTP request for session {sid}',
+                            'unexpected-http')
+                        r = self._bad_request('Unexpected HTTP request')
         elif method == 'OPTIONS':
             r = self._ok()
         else:

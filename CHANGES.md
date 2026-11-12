@@ -1,5 +1,11 @@
 # python-engineio change log
 
+**Unreleased**
+
+- Do not deliver packets from an already read polling request after a CLOSE packet starts shutting the socket down, and reject new polling POSTs once the socket is closing or closed
+- Distinguish undecodable payloads from clean disconnects: malformed payloads return a bad request without removing the session or emitting a disconnect event, while other protocol errors close the socket with a transport error
+- Prevent `close()` from blocking on the outgoing queue when no poller is connected, and report the disconnect event only once
+
 **Release 4.15.1** - 2026-10-28
 
 - Reject requests before the connection completes ([commit](https://code.miguelgrinberg.com/miguelgrinberg/python-engineio.git/commit/89ce40654dcb23405e7f78b04d9b38aacf05987c))

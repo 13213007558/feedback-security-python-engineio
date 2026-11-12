@@ -112,6 +112,11 @@ class Socket(base_socket.BaseSocket):
             body = environ['wsgi.input'].read(length).decode('utf-8')
             p = payload.Payload(encoded_payload=body)
             for pkt in p.packets:
+                if self.closing or self.closed:
+                    # A CLOSE packet already started shutting down this
+                    # socket, so any further packet from this already read
+                    # request must not reach the application handlers.
+                    break
                 self.receive(pkt)
 
     def close(self, wait=True, abort=False, reason=None):
@@ -125,9 +130,12 @@ class Socket(base_socket.BaseSocket):
             if not abort:
                 self.send(packet.Packet(packet.CLOSE))
             self.closed = True
-            self.queue.put(None)
-            if wait:
+            if wait and not self.queue.empty():
+                # Wait only for packets queued before the close; the sentinel
+                # below is a control marker and must not keep close() blocked
+                # when no poller is connected anymore.
                 self.queue.join()
+            self.queue.put(None)
 
     def schedule_ping(self):
         # only schedule a new ping if the previous ping wait cycle completed

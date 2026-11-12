@@ -561,6 +561,7 @@ class TestSocket:
         mock_server = self._get_mock_server()
         s = async_socket.AsyncSocket(mock_server, 'sid')
         s.queue = mock.MagicMock()
+        s.queue.empty.return_value = False
         s.queue.put = mock.AsyncMock()
         s.queue.join = mock.AsyncMock()
         await s.close(wait=True)

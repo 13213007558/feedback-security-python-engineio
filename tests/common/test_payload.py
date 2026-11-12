@@ -58,9 +58,9 @@ class TestPayload:
         assert p.encode() == '4abc'
 
     def test_decode_invalid_payload(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(payload.PayloadDecodeError):
             payload.Payload(encoded_payload='bad payload')
 
     def test_decode_multi_payload_with_too_many_packets(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(payload.PayloadDecodeError):
             payload.Payload(encoded_payload='4abc\x1e4def\x1e' * 9 + '6')

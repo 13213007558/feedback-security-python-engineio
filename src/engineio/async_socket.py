@@ -34,8 +34,10 @@ class AsyncSocket(base_socket.BaseSocket):
 
     async def receive(self, pkt):
         """Receive packet from the client."""
+        packet_name = packet.packet_names[pkt.packet_type] \
+            if pkt.packet_type < len(packet.packet_names) else 'UNKNOWN'
         self.server.logger.info('%s: Received packet %s data %s',
-                                self.sid, packet.packet_names[pkt.packet_type],
+                                self.sid, packet_name,
                                 pkt.data if not isinstance(pkt.data, bytes)
                                 else '<binary>')
         if pkt.packet_type == packet.PONG:
@@ -111,6 +113,11 @@ class AsyncSocket(base_socket.BaseSocket):
             body = (await environ['wsgi.input'].read(length)).decode('utf-8')
             p = payload.Payload(encoded_payload=body)
             for pkt in p.packets:
+                if self.closing or self.closed:
+                    # A CLOSE packet already started shutting down this
+                    # socket, so any further packet from this already read
+                    # request must not reach the application handlers.
+                    break
                 await self.receive(pkt)
 
     async def close(self, wait=True, abort=False, reason=None):
@@ -124,8 +131,12 @@ class AsyncSocket(base_socket.BaseSocket):
             if not abort:
                 await self.send(packet.Packet(packet.CLOSE))
             self.closed = True
-            if wait:
+            if wait and not self.queue.empty():
+                # Wait only for packets queued before the close; the sentinel
+                # below is a control marker and must not keep close() blocked
+                # when no poller is connected anymore.
                 await self.queue.join()
+            await self.queue.put(None)
 
     def schedule_ping(self):
         # only schedule a new ping if the previous ping wait cycle completed

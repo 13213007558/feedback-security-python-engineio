@@ -1,6 +1,16 @@
 import urllib
 
+from . import exceptions
 from . import packet
+
+
+class PayloadDecodeError(exceptions.EngineIOError, ValueError):
+    """Raised when an incoming polling payload cannot be decoded.
+
+    Inheriting from ``ValueError`` preserves the historical exception type
+    while allowing the request handlers to treat it as an Engine.IO protocol
+    error rather than an unexpected server fault.
+    """
 
 
 class Payload:
@@ -41,6 +51,9 @@ class Payload:
 
         encoded_packets = encoded_payload.split('\x1e')
         if len(encoded_packets) > self.max_decode_packets:
-            raise ValueError('Too many packets in payload')
-        self.packets = [packet.Packet(encoded_packet=encoded_packet)
-                        for encoded_packet in encoded_packets]
+            raise PayloadDecodeError('Too many packets in payload')
+        try:
+            self.packets = [packet.Packet(encoded_packet=encoded_packet)
+                            for encoded_packet in encoded_packets]
+        except ValueError as exc:
+            raise PayloadDecodeError(str(exc))
