@@ -159,39 +159,59 @@ class AsyncSocket(base_socket.BaseSocket):
             return data
 
         if self.connected:
-            # the socket was already connected, so this is an upgrade
-            self.upgrading = True  # hold packet sends during the upgrade
+            # the socket was already connected, so this is an upgrade. Only
+            # one candidate may own the upgrade at a time.
+            if not self._begin_upgrade(ws):
+                self.server.logger.info(
+                    '%s: Rejected concurrent websocket upgrade candidate',
+                    self.sid)
+                await ws.close()
+                return
 
+            committed = False
             try:
                 pkt = await websocket_wait()
-            except OSError:  # pragma: no cover
-                return
-            decoded_pkt = packet.Packet(encoded_packet=pkt)
-            if decoded_pkt.packet_type != packet.PING or \
-                    decoded_pkt.data != 'probe':
-                self.server.logger.info(
-                    '%s: Failed websocket upgrade, no PING packet', self.sid)
-                self.upgrading = False
-                return
-            await ws.send(packet.Packet(packet.PONG, data='probe').encode())
-            await self.queue.put(packet.Packet(packet.NOOP))  # end poll
+                if pkt is None:
+                    self.server.logger.info(
+                        '%s: Failed websocket upgrade, websocket closed',
+                        self.sid)
+                    return
+                decoded_pkt = packet.Packet(encoded_packet=pkt)
+                if decoded_pkt.packet_type != packet.PING or \
+                        decoded_pkt.data != 'probe':
+                    self.server.logger.info(
+                        '%s: Failed websocket upgrade, no PING packet',
+                        self.sid)
+                    return
+                await ws.send(
+                    packet.Packet(packet.PONG, data='probe').encode())
+                await self.queue.put(packet.Packet(packet.NOOP))  # end poll
 
-            try:
                 pkt = await websocket_wait()
-            except OSError:  # pragma: no cover
-                self.upgrading = False
-                return
-            decoded_pkt = packet.Packet(encoded_packet=pkt)
-            if decoded_pkt.packet_type != packet.UPGRADE:
-                self.upgraded = False
+                if pkt is None:
+                    self.server.logger.info(
+                        '%s: Failed websocket upgrade, websocket closed '
+                        'before UPGRADE packet', self.sid)
+                    return
+                decoded_pkt = packet.Packet(encoded_packet=pkt)
+                if decoded_pkt.packet_type != packet.UPGRADE:
+                    self.server.logger.info(
+                        ('%s: Failed websocket upgrade, expected UPGRADE '
+                         'packet, received %s instead.'),
+                        self.sid, pkt)
+                    return
+                self._commit_upgrade(ws)
+                committed = True
+            except (ConnectionError, OSError):
                 self.server.logger.info(
-                    ('%s: Failed websocket upgrade, expected UPGRADE packet, '
-                     'received %s instead.'),
-                    self.sid, pkt)
-                self.upgrading = False
+                    '%s: Failed websocket upgrade, websocket closed', self.sid)
                 return
-            self.upgraded = True
-            self.upgrading = False
+            finally:
+                if not committed:
+                    # An incomplete probe must never leave the session
+                    # reserved for the websocket. Restore polling even if the
+                    # handler exits through an exception.
+                    self._abort_upgrade(ws)
         else:
             self.connected = True
             self.upgraded = True
