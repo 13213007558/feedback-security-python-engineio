@@ -1,5 +1,4 @@
 import sys
-import time
 
 from . import base_socket
 from . import exceptions
@@ -58,7 +57,10 @@ class Socket(base_socket.BaseSocket):
         if self.closed:
             raise exceptions.SocketIsClosedError()
         last_ping = self.last_ping
-        if last_ping and time.time() - last_ping > self.server.ping_timeout:
+        # Use the monotonic clock so that wall clock adjustments (NTP slews,
+        # manual time changes) cannot delay or trigger the timeout.
+        if last_ping and self._now() - last_ping > \
+                self.server.ping_timeout:
             self.server.logger.info('%s: Client is gone, closing socket',
                                     self.sid)
             # Passing abort=False here will cause close() to write a
@@ -130,16 +132,30 @@ class Socket(base_socket.BaseSocket):
                 self.queue.join()
 
     def schedule_ping(self):
-        # only schedule a new ping if the previous ping wait cycle completed
-        if self.last_ping:
+        # Only one ping wait cycle may be active at a time. A pong that
+        # arrives early, or a duplicated pong, must not start additional ping
+        # scheduler chains. The lock makes this safe for thread based async
+        # modes that can deliver pong packets concurrently.
+        if self.closing or self.closed:
+            return
+        with self._ping_lock:
+            if self.closing or self.closed or self.last_ping is None:
+                return
             self.last_ping = None
-            self.server.start_background_task(self._send_ping)
+            self.ping_generation += 1
+            generation = self.ping_generation
+        self.server.start_background_task(self._send_ping, generation)
 
-    def _send_ping(self):
+    def _send_ping(self, generation):
         self.server.sleep(self.server.ping_interval)
-        if not self.closing and not self.closed:
-            self.last_ping = time.time()
-            self.send(packet.Packet(packet.PING))
+        # The cycle may have been superseded by a pong (which scheduled a new
+        # generation) or canceled by a close. Such a stale task must neither
+        # send a ping nor extend the liveness window.
+        if self.closing or self.closed or \
+                generation != self.ping_generation:
+            return
+        self.last_ping = self._now()
+        self.send(packet.Packet(packet.PING))
 
     def _upgrade_websocket(self, environ, start_response):
         """Upgrade the connection from polling to websocket."""

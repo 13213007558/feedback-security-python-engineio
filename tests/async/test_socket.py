@@ -10,6 +10,18 @@ from engineio import packet
 from engineio import payload
 
 
+class FakeMonotonicClock:
+    """A controllable stand-in for the socket's monotonic clock."""
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
 class TestSocket:
     def _get_read_mock_coro(self, payload):
         mock_input = mock.MagicMock()
@@ -34,18 +46,47 @@ class TestSocket:
         mock_server._async['translate_request'].return_value = 'request'
         mock_server._async['make_response'].return_value = 'response'
         mock_server._trigger_event = mock.AsyncMock()
+        self.bg_tasks = []
 
         def bg_task(target, *args, **kwargs):
-            return asyncio.ensure_future(target(*args, **kwargs))
+            task = asyncio.ensure_future(target(*args, **kwargs))
+            self.bg_tasks.append(task)
+            return task
 
         def create_queue(*args, **kwargs):
             queue = asyncio.Queue(*args, **kwargs)
             queue.Empty = asyncio.QueueEmpty
             return queue
 
+        async def real_sleep(seconds):
+            await asyncio.sleep(seconds)
+
+        self.ping_cycles = []
+
+        async def controlled_sleep(seconds):
+            # Stand-in for the ping interval wait: instead of blocking for
+            # real wall time, yield control once and then return. Each call
+            # records a cycle so the test can assert on the number of pings
+            # deterministically.
+            self.ping_cycles.append(seconds)
+            await asyncio.sleep(0)
+
         mock_server.start_background_task = bg_task
         mock_server.create_queue = create_queue
+        mock_server.sleep = real_sleep
+        self._controlled_sleep = controlled_sleep
         return mock_server
+
+    def _use_controlled_sleep(self, mock_server):
+        mock_server.sleep = self._controlled_sleep
+
+    async def _drain_background_tasks(self):
+        """Let every scheduled ping task run to completion."""
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if all(task.done() for task in self.bg_tasks):
+                break
+        await asyncio.gather(*self.bg_tasks, return_exceptions=True)
 
     async def test_create(self):
         mock_server = self._get_mock_server()
@@ -91,48 +132,144 @@ class TestSocket:
 
     async def test_schedule_ping(self):
         mock_server = self._get_mock_server()
-        mock_server.ping_interval = 0.01
+        self._use_controlled_sleep(mock_server)
         s = async_socket.AsyncSocket(mock_server, 'sid')
         s.send = mock.AsyncMock()
-
-        async def schedule_ping_and_sleep():
-            s.schedule_ping()
-            await asyncio.sleep(0.05)
-
-        await schedule_ping_and_sleep()
+        s.schedule_ping()
+        assert s.last_ping is None
+        assert len(self.bg_tasks) == 1
+        await self._drain_background_tasks()
         assert s.last_ping is not None
         assert s.send.await_args_list[0][0][0].encode() == '2'
 
     async def test_schedule_ping_twice(self):
         mock_server = self._get_mock_server()
-        mock_server.ping_interval = 0.1
+        self._use_controlled_sleep(mock_server)
         s = async_socket.AsyncSocket(mock_server, 'sid')
         s.send = mock.AsyncMock()
-
-        async def schedule_ping_and_sleep():
-            s.schedule_ping()
-            await asyncio.sleep(0.2)
-
         s.schedule_ping()
-        assert s.last_ping is None
-        await schedule_ping_and_sleep()
+        # a second pong while the first wait cycle is still pending must be
+        # ignored and must not start another scheduler chain
+        s.schedule_ping()
+        assert len(self.bg_tasks) == 1
+        await self._drain_background_tasks()
         assert s.last_ping is not None
         assert s.send.await_count == 1
 
+    async def test_duplicate_pong_does_not_start_second_chain(self):
+        mock_server = self._get_mock_server()
+        self._use_controlled_sleep(mock_server)
+        s = async_socket.AsyncSocket(mock_server, 'sid')
+        s.send = mock.AsyncMock()
+        pong = packet.Packet(packet.PONG)
+
+        # first pong starts the single wait cycle
+        await s.receive(pong)
+        generation = s.ping_generation
+        assert s.last_ping is None
+        assert len(self.bg_tasks) == 1
+        # duplicated, early pongs while the cycle is pending are ignored
+        await s.receive(packet.Packet(packet.PONG))
+        await s.receive(packet.Packet(packet.PONG))
+        assert len(self.bg_tasks) == 1
+        assert s.ping_generation == generation
+
+        await self._drain_background_tasks()
+        assert s.send.await_count == 1
+        assert s.send.await_args_list[0][0][0].packet_type == packet.PING
+
+        # the next legitimate pong arms exactly one more cycle
+        await s.receive(pong)
+        assert len(self.bg_tasks) == 2
+        await self._drain_background_tasks()
+        assert s.send.await_count == 2
+
+    async def test_normal_ping_pong_roundtrip(self):
+        mock_server = self._get_mock_server()
+        self._use_controlled_sleep(mock_server)
+        s = async_socket.AsyncSocket(mock_server, 'sid')
+        s.schedule_ping()
+        await self._drain_background_tasks()
+        sent = s.queue.get_nowait()
+        assert sent.packet_type == packet.PING
+        # the liveness timestamp uses the monotonic clock
+        assert s.last_ping is not None
+        # client answers in time; stub the scheduler so the pong does not
+        # leave another background task parked behind the test
+        s.schedule_ping = mock.MagicMock()
+        await s.receive(packet.Packet(packet.PONG))
+        s.schedule_ping.assert_called_once_with()
+
+    async def test_schedule_ping_closing_socket(self):
+        mock_server = self._get_mock_server()
+        s = async_socket.AsyncSocket(mock_server, 'sid')
+        s.send = mock.AsyncMock()
+        s.closing = True
+        s.schedule_ping()
+        assert self.bg_tasks == []
+        assert s.last_ping is not None
+        s.send.assert_not_awaited()
+
     async def test_schedule_ping_closed_socket(self):
         mock_server = self._get_mock_server()
-        mock_server.ping_interval = 0.01
         s = async_socket.AsyncSocket(mock_server, 'sid')
         s.send = mock.AsyncMock()
         s.closed = True
 
         async def schedule_ping():
             s.schedule_ping()
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0)
 
         await schedule_ping()
-        assert s.last_ping is None
+        assert self.bg_tasks == []
+        assert s.last_ping is not None
         s.send.assert_not_awaited()
+
+    async def test_task_waking_during_close_does_not_ping(self):
+        mock_server = self._get_mock_server()
+        gate = asyncio.Event()
+
+        async def blocking_sleep(_seconds):
+            # park the ping wait cycle until the test closes the socket and
+            # then releases it, simulating the task waking during shutdown
+            await gate.wait()
+
+        mock_server.sleep = blocking_sleep
+        s = async_socket.AsyncSocket(mock_server, 'sid')
+        s.schedule_ping()
+        assert s.last_ping is None
+        await asyncio.sleep(0)  # let the background task enter the wait
+        await s.close(wait=False, abort=True)
+        assert s.closed
+        gate.set()  # wake the sleeping task after close
+        await asyncio.gather(*self.bg_tasks, return_exceptions=True)
+        # the queue must not contain any PING packet sent by the stale task
+        queued = []
+        while True:
+            try:
+                queued.append(s.queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        assert all(p is None or p.packet_type != packet.PING
+                   for p in queued)
+        # the stale task must not have refreshed the liveness timestamp
+        assert s.last_ping is None
+
+    async def test_stale_generation_does_not_ping(self):
+        mock_server = self._get_mock_server()
+        self._use_controlled_sleep(mock_server)
+        s = async_socket.AsyncSocket(mock_server, 'sid')
+        s.send = mock.AsyncMock()
+        s.schedule_ping()
+        stale_generation = s.ping_generation
+        # a new cycle supersedes the sleeping one without waiting for it
+        s.last_ping = s._now()
+        s.schedule_ping()
+        assert s.ping_generation == stale_generation + 1
+        # when both wait cycles resolve, only the current generation may send
+        await self._drain_background_tasks()
+        assert s.send.await_count == 1
+        assert s.send.await_args_list[0][0][0].packet_type == packet.PING
 
     async def test_pong(self):
         mock_server = self._get_mock_server()
@@ -169,11 +306,43 @@ class TestSocket:
         mock_server.ping_interval = 6
         mock_server.ping_interval_grace_period = 2
         s = async_socket.AsyncSocket(mock_server, 'sid')
-        s.last_ping = time.time() - 9
+        fake_clock = FakeMonotonicClock()
+        s._now = fake_clock
+        s.last_ping = fake_clock()
+        fake_clock.advance(9)
         s.close = mock.AsyncMock()
         await s.send('packet')
         s.close.assert_awaited_once_with(
             wait=False, abort=False, reason=mock_server.reason.PING_TIMEOUT)
+
+    async def test_timeout_ignores_wall_clock_rollback(self):
+        # rolling the wall clock backwards must not keep a dead client alive
+        mock_server = self._get_mock_server()
+        mock_server.ping_timeout = 20
+        s = async_socket.AsyncSocket(mock_server, 'sid')
+        fake_clock = FakeMonotonicClock()
+        s._now = fake_clock
+        s.last_ping = fake_clock()
+        fake_clock.advance(21)  # real elapsed time exceeds the timeout
+        with mock.patch('time.time', return_value=time.time() - 3600):
+            s.close = mock.AsyncMock()
+            assert not await s.check_ping_timeout()
+        s.close.assert_awaited_once_with(
+            wait=False, abort=False,
+            reason=mock_server.reason.PING_TIMEOUT)
+
+    async def test_liveness_ignores_wall_clock_forward_jump(self):
+        # a forward wall clock jump must not cause a false timeout
+        mock_server = self._get_mock_server()
+        mock_server.ping_timeout = 20
+        s = async_socket.AsyncSocket(mock_server, 'sid')
+        fake_clock = FakeMonotonicClock()
+        s._now = fake_clock
+        s.last_ping = fake_clock()
+        fake_clock.advance(1)  # barely any real elapsed time
+        with mock.patch('time.time', return_value=time.time() + 3600):
+            assert await s.check_ping_timeout()
+            assert not s.closed
 
     async def test_polling_read(self):
         mock_server = self._get_mock_server()

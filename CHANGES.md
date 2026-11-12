@@ -1,5 +1,17 @@
 # python-engineio change log
 
+**Unreleased**
+
+- Use a monotonic clock for server-side ping timeout and ping scheduling so
+  that wall clock adjustments (NTP synchronization or manual time changes)
+  can no longer keep unresponsive clients connected or trigger false
+  timeouts. Human readable log output continues to use the wall clock.
+- Harden the ping state machine in both the sync and async servers:
+  duplicated and early pong packets can no longer start multiple ping
+  scheduler chains, and a ping task that wakes up while the socket is
+  closing or after its cycle was superseded does not send a ping nor refresh
+  the liveness timestamp.
+
 **Release 4.15.1** - 2026-10-28
 
 - Reject requests before the connection completes ([commit](https://code.miguelgrinberg.com/miguelgrinberg/python-engineio.git/commit/89ce40654dcb23405e7f78b04d9b38aacf05987c))
